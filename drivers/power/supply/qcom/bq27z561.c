@@ -881,9 +881,32 @@ static int fg_read_system_soc(struct bq_fg_chip *bq)
 	return soc;
 }
 
+/*
+ * Some gauges intermittently return all-ones or other impossible raw
+ * measurements without the I2C controller reporting a transport error.
+ * Retry the measurement before passing it to power_supply consumers.
+ * Never replace sustained sensor failure with a benign cached temperature.
+ */
+#define BQ_BAD_READ_RETRIES       2
+#define BQ_TEMP_RAW_MIN           2330 /* -40.0 C, in 0.1 K */
+#define BQ_TEMP_RAW_MAX           3730 /* 100.0 C, in 0.1 K */
+#define BQ_TEMP_FAILSAFE          700  /* 70.0 C, in 0.1 C */
+#define BQ_VOLT_RAW_MAX           5000 /* 5.0 V, in mV */
+
+static bool fg_temperature_invalid(u16 temp)
+{
+	return temp == 0xffff || temp < BQ_TEMP_RAW_MIN ||
+		temp > BQ_TEMP_RAW_MAX;
+}
+
+static bool fg_voltage_invalid(u16 volt)
+{
+	return volt == 0xffff || volt > BQ_VOLT_RAW_MAX;
+}
+
 static int fg_read_temperature(struct bq_fg_chip *bq)
 {
-	int ret;
+	int ret = -EIO, attempt;
 	u16 temp = 0;
 	static int last_temp;
 
@@ -896,20 +919,25 @@ static int fg_read_temperature(struct bq_fg_chip *bq)
 	if(is_std_battery == false)
 		return g_nonstd_bq.temp;
 
-	ret = fg_read_word(bq, bq->regs[BQ_FG_REG_TEMP], &temp);
-	if (ret < 0) {
-		bq_dbg(PR_OEM, "could not read temperature, ret = %d\n", ret);
-		return last_temp;
+	for (attempt = 0; attempt <= BQ_BAD_READ_RETRIES; attempt++) {
+		ret = fg_read_word(bq, bq->regs[BQ_FG_REG_TEMP], &temp);
+		if (ret >= 0 && !fg_temperature_invalid(temp)) {
+			last_temp = temp - 2730;
+			return last_temp;
+		}
+		if (attempt < BQ_BAD_READ_RETRIES)
+			usleep_range(2000, 4000);
 	}
-	last_temp = temp - 2730;
 
-	return temp - 2730;
-
+	/* Do not mask a persistently missing/implausible safety sensor. */
+	pr_warn_ratelimited("temperature gauge failed after retries: ret=%d raw=0x%04x; reporting failsafe 70 C\n",
+			ret, (unsigned int)temp);
+	return BQ_TEMP_FAILSAFE;
 }
 
 static int fg_read_volt(struct bq_fg_chip *bq)
 {
-	int ret;
+	int ret = -EIO, attempt;
 	u16 volt = 0;
 	static int last_volt;
 
@@ -919,10 +947,22 @@ static int fg_read_volt(struct bq_fg_chip *bq)
 	if(is_std_battery == false)
 		return g_nonstd_bq.vbat;
 
-	ret = fg_read_word(bq, bq->regs[BQ_FG_REG_VOLT], &volt);
+	for (attempt = 0; attempt <= BQ_BAD_READ_RETRIES; attempt++) {
+		ret = fg_read_word(bq, bq->regs[BQ_FG_REG_VOLT], &volt);
+		if (ret >= 0 && !fg_voltage_invalid(volt))
+			break;
+		if (attempt < BQ_BAD_READ_RETRIES)
+			usleep_range(2000, 4000);
+	}
 	if (ret < 0) {
 		bq_dbg(PR_OEM, "could not read voltage, ret = %d\n", ret);
 		return last_volt;
+	}
+	if (fg_voltage_invalid(volt)) {
+		/* Keep reporting a persistent anomaly rather than hiding it. */
+		pr_warn_ratelimited("invalid battery voltage after retries: %u mV\n",
+			(unsigned int)volt);
+		return volt;
 	}
 
 	if(volt < 3450) {
