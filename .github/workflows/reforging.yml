@@ -1,6 +1,9 @@
 name: Start Reforge
 
 on:
+  push:
+    branches:
+      - battery-sensor-fix
   workflow_dispatch:
     inputs:
       build_type:
@@ -36,8 +39,8 @@ concurrency:
 env:
   DEVICE_CODENAME: "sweet2"
   # Input dilempar lewat env, bukan di-inline ke script shell (cegah injection)
-  BUILD_TYPE: ${{ github.event.inputs.build_type }}
-  COMPILER: ${{ github.event.inputs.compiler }}
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'MIUI-OOS' }}
+  COMPILER: ${{ github.event.inputs.compiler || 'AOSP-Clang' }}
   REF_NAME: ${{ github.ref_name }}
   ACTOR: ${{ github.actor }}
 
@@ -377,6 +380,7 @@ jobs:
         fi
 
     - name: ☁️ Upload ZIP to CDN
+      if: ${{ github.repository == 'Naughty-stuff/los_kernel_xiaomi_sm6150' }}
       id: cdn
       continue-on-error: true
       shell: bash
